@@ -26,7 +26,7 @@ from pretrain_common import (
     TOKENIZER_CORPUS,
     TINY_MAX_SEQ_LEN,
     create_local_tokenizer,
-    create_tiny_model,
+    create_model,
     create_mock_dataset,
     create_verify_training_args,
     create_data_collator,
@@ -84,7 +84,7 @@ check("100M 配置参数量在合理范围 (80-250M)", 80 < estimated_params < 2
 
 # 用小模型做实际测试
 print("  -- 使用缩小版模型做功能验证 --")
-model = create_tiny_model(tokenizer)
+model = create_model(tokenizer)
 num_params = model.num_parameters() / 1e6
 print(f"  测试模型参数量: {num_params:.2f} M")
 check("模型初始化成功", model is not None)

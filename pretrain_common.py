@@ -80,16 +80,18 @@ def create_local_tokenizer(corpus=None):
     return tokenizer
 
 
-def create_tiny_model(tokenizer):
-    """创建缩小版 Llama 模型（2层，hidden_size=64），用于快速验证。"""
+def create_model(tokenizer, hidden_size=TINY_HIDDEN_SIZE, intermediate_size=TINY_INTERMEDIATE_SIZE,
+                 num_layers=TINY_NUM_LAYERS, num_heads=TINY_NUM_HEADS,
+                 max_seq_len=TINY_MAX_SEQ_LEN):
+    """创建 Llama 模型。默认为缩小版（2层，hidden_size=64），用于快速验证。"""
     config = LlamaConfig(
         vocab_size=len(tokenizer),
-        hidden_size=TINY_HIDDEN_SIZE,
-        intermediate_size=TINY_INTERMEDIATE_SIZE,
-        num_hidden_layers=TINY_NUM_LAYERS,
-        num_attention_heads=TINY_NUM_HEADS,
-        num_key_value_heads=TINY_NUM_HEADS,
-        max_position_embeddings=TINY_MAX_SEQ_LEN,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        max_position_embeddings=max_seq_len,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -97,12 +99,8 @@ def create_tiny_model(tokenizer):
     return LlamaForCausalLM(config)
 
 
-def create_mock_dataset(tokenizer, texts=None, max_length=TINY_MAX_SEQ_LEN):
-    """创建 mock 数据集并 tokenize。"""
-    if texts is None:
-        texts = MOCK_TEXTS
-    dataset = Dataset.from_dict({"text": texts})
-
+def tokenize_dataset(dataset, tokenizer, max_length=TINY_MAX_SEQ_LEN, remove_columns=None):
+    """对数据集进行 tokenize。"""
     def tokenize_fn(examples):
         return tokenizer(
             examples["text"],
@@ -111,7 +109,17 @@ def create_mock_dataset(tokenizer, texts=None, max_length=TINY_MAX_SEQ_LEN):
             padding="max_length",
         )
 
-    return dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
+    if remove_columns is None:
+        remove_columns = ["text"]
+    return dataset.map(tokenize_fn, batched=True, remove_columns=remove_columns)
+
+
+def create_mock_dataset(tokenizer, texts=None, max_length=TINY_MAX_SEQ_LEN):
+    """创建 mock 数据集并 tokenize。"""
+    if texts is None:
+        texts = MOCK_TEXTS
+    dataset = Dataset.from_dict({"text": texts})
+    return tokenize_dataset(dataset, tokenizer, max_length=max_length)
 
 
 def create_verify_training_args(output_dir="./verify-checkpoints"):
