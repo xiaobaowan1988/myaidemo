@@ -13,21 +13,24 @@
 """
 
 import os
-import sys
 import shutil
-import tempfile
-import json
+import sys
 import torch
 from transformers import (
     PreTrainedTokenizerFast,
     LlamaConfig,
     LlamaForCausalLM,
     Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
 )
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
-from datasets import Dataset
+from pretrain_common import (
+    TOKENIZER_CORPUS,
+    TINY_MAX_SEQ_LEN,
+    create_local_tokenizer,
+    create_tiny_model,
+    create_mock_dataset,
+    create_verify_training_args,
+    create_data_collator,
+)
 
 PASSED = 0
 FAILED = 0
@@ -45,35 +48,11 @@ def check(name, condition, detail=""):
 # ── Test 1: 创建本地 Tokenizer (模拟 gpt2) ─────────────────────────
 print("\n=== Test 1: Tokenizer 创建与配置 ===")
 
-# 创建一个小型 BPE tokenizer（离线，不需要网络）
-corpus = [
-    "The quick brown fox jumps over the lazy dog. " * 50,
-    "Machine learning is a subset of artificial intelligence. " * 50,
-    "Python is a great programming language for data science. " * 50,
-    "Pre-training large language models requires significant compute resources. " * 50,
+# 添加额外语料行以增强 tokenizer
+extra_corpus = TOKENIZER_CORPUS + [
     "The future of AI is bright and full of possibilities. " * 50,
-    "Natural language processing enables computers to understand human language. " * 50,
 ]
-base_tokenizer = Tokenizer(models.BPE())
-base_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-base_tokenizer.decoder = decoders.ByteLevel()
-trainer_tok = trainers.BpeTrainer(
-    vocab_size=512,
-    special_tokens=["<|endoftext|>", "<pad>"],
-    min_frequency=2,
-)
-base_tokenizer.train_from_iterator(corpus, trainer=trainer_tok)
-
-# 将其包装为 HuggingFace PreTrainedTokenizerFast
-tokenizer_dir = tempfile.mkdtemp()
-base_tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-tokenizer = PreTrainedTokenizerFast(
-    tokenizer_file=os.path.join(tokenizer_dir, "tokenizer.json"),
-    eos_token="<|endoftext|>",
-    bos_token="<|endoftext|>",
-    pad_token="<|endoftext|>",  # 与原始代码逻辑一致：pad_token = eos_token
-)
-
+tokenizer = create_local_tokenizer(corpus=extra_corpus)
 VOCAB_SIZE = len(tokenizer)
 print(f"  本地 tokenizer vocab size: {VOCAB_SIZE}")
 check("tokenizer 创建成功", tokenizer is not None)
@@ -85,31 +64,11 @@ encoded = tokenizer("Hello world", truncation=True, max_length=128, padding="max
 check("编码后 input_ids 长度 == 128", len(encoded["input_ids"]) == 128)
 check("attention_mask 长度 == 128", len(encoded["attention_mask"]) == 128)
 
-shutil.rmtree(tokenizer_dir, ignore_errors=True)
-
 # ── Test 2: Model Config & Init ────────────────────────────────────
 print("\n=== Test 2: 模型初始化 ===")
 
-# 使用缩小版参数（验证架构正确性，不需要完整 100M）
-# 同时验证原始 100M 配置的参数量计算
+# 验证原始 100M 配置的参数量计算
 print("  -- 验证原始 100M 配置的参数量 --")
-config_100m = LlamaConfig(
-    vocab_size=50257,       # gpt2 的 vocab size
-    hidden_size=768,
-    intermediate_size=3072,
-    num_hidden_layers=12,
-    num_attention_heads=12,
-    num_key_value_heads=12,
-    max_position_embeddings=1024,
-)
-# 手动计算参数量（不实例化完整模型以节省内存）
-# Embedding: vocab_size * hidden_size = 50257 * 768
-# 每个 Transformer 层:
-#   Self-Attn: 4 * hidden_size^2 (Q,K,V,O) = 4 * 768^2
-#   MLP: 3 * hidden_size * intermediate_size (gate, up, down) = 3 * 768 * 3072
-#   LayerNorm: 2 * hidden_size = 2 * 768
-# Final LN: hidden_size
-# LM Head: vocab_size * hidden_size (通常与 embedding 共享或不共享)
 embed_params = 50257 * 768
 per_layer_attn = 4 * 768 * 768  # Q, K, V, O projections
 per_layer_mlp = 3 * 768 * 3072  # gate_proj, up_proj, down_proj
@@ -117,36 +76,21 @@ per_layer_ln = 2 * 768
 per_layer = per_layer_attn + per_layer_mlp + per_layer_ln
 total_layers = 12 * per_layer
 final_ln = 768
-lm_head = 50257 * 768  # LlamaForCausalLM 默认 tie_word_embeddings=False，LM Head 独立
+lm_head = 50257 * 768
 estimated_params = (embed_params + total_layers + final_ln + lm_head) / 1e6
 print(f"  估算参数量: {estimated_params:.2f} M")
-# 注意：LlamaForCausalLM 默认不共享 embedding 权重，实际参数量约 190M
-# 若要真正得到 ~100M，可设 tie_word_embeddings=True 或减小 hidden_size/layers
-# 这里放宽范围，验证参数量在合理区间
 check("100M 配置参数量在合理范围 (80-250M)", 80 < estimated_params < 250,
       f"估算: {estimated_params:.2f}M")
 
 # 用小模型做实际测试
 print("  -- 使用缩小版模型做功能验证 --")
-config = LlamaConfig(
-    vocab_size=VOCAB_SIZE,
-    hidden_size=64,
-    intermediate_size=128,
-    num_hidden_layers=2,
-    num_attention_heads=4,
-    num_key_value_heads=4,
-    max_position_embeddings=128,
-    pad_token_id=tokenizer.pad_token_id,
-    bos_token_id=tokenizer.bos_token_id,
-    eos_token_id=tokenizer.eos_token_id,
-)
-model = LlamaForCausalLM(config)
+model = create_tiny_model(tokenizer)
 num_params = model.num_parameters() / 1e6
 print(f"  测试模型参数量: {num_params:.2f} M")
 check("模型初始化成功", model is not None)
-check("config.vocab_size 正确", config.vocab_size == VOCAB_SIZE)
-check("config.num_hidden_layers == 2", config.num_hidden_layers == 2)
-check("config.max_position_embeddings == 128", config.max_position_embeddings == 128)
+check("config.vocab_size 正确", model.config.vocab_size == VOCAB_SIZE)
+check("config.num_hidden_layers == 2", model.config.num_hidden_layers == 2)
+check("config.max_position_embeddings == 128", model.config.max_position_embeddings == 128)
 
 # ── Test 3: Forward pass ───────────────────────────────────────────
 print("\n=== Test 3: 前向传播 ===")
@@ -160,7 +104,6 @@ check("loss 非空", outputs.loss is not None)
 check("loss 是标量", outputs.loss.dim() == 0)
 check("logits shape 正确", outputs.logits.shape == (2, 64, VOCAB_SIZE),
       f"实际: {outputs.logits.shape}")
-# 随机初始化的模型，loss 应接近 ln(vocab_size)
 expected_loss = torch.log(torch.tensor(float(VOCAB_SIZE))).item()
 actual_loss = outputs.loss.item()
 print(f"  期望 loss ≈ ln({VOCAB_SIZE}) = {expected_loss:.2f}, 实际 loss = {actual_loss:.2f}")
@@ -170,23 +113,7 @@ check(f"初始 loss 接近 ln(vocab_size)",
 
 # ── Test 4: Data pipeline (mock) ──────────────────────────────────
 print("\n=== Test 4: 数据预处理管道 ===")
-mock_texts = [
-    "The quick brown fox jumps over the lazy dog. " * 5,
-    "Machine learning is a subset of artificial intelligence. " * 5,
-    "Python is a great programming language for data science. " * 5,
-    "Pre-training large language models requires significant compute. " * 5,
-]
-mock_dataset = Dataset.from_dict({"text": mock_texts})
-
-def tokenize_function(examples):
-    return tokenizer(
-        examples["text"],
-        truncation=True,
-        max_length=128,
-        padding="max_length"
-    )
-
-tokenized_dataset = mock_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+tokenized_dataset = create_mock_dataset(tokenizer)
 
 check("tokenized dataset 非空", len(tokenized_dataset) == 4)
 check("包含 input_ids 列", "input_ids" in tokenized_dataset.column_names)
@@ -195,7 +122,7 @@ check("每条 input_ids 长度 == 128", len(tokenized_dataset[0]["input_ids"]) =
 
 # ── Test 5: DataCollator ──────────────────────────────────────────
 print("\n=== Test 5: DataCollator ===")
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+data_collator = create_data_collator(tokenizer)
 batch = data_collator([tokenized_dataset[i] for i in range(2)])
 
 check("batch 包含 input_ids", "input_ids" in batch)
@@ -203,7 +130,6 @@ check("batch 包含 labels", "labels" in batch)
 check("batch 包含 attention_mask", "attention_mask" in batch)
 check("labels shape == input_ids shape",
       batch["labels"].shape == batch["input_ids"].shape)
-# 对于 CLM，labels 中 pad 部分应为 -100
 pad_positions = (batch["attention_mask"] == 0)
 if pad_positions.any():
     check("pad 位置 labels == -100",
@@ -214,22 +140,7 @@ else:
 # ── Test 6: Trainer 小规模训练 ─────────────────────────────────────
 print("\n=== Test 6: Trainer 训练验证（5 步） ===")
 output_dir = "./verify_test_output"
-training_args = TrainingArguments(
-    output_dir=output_dir,
-    max_steps=5,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=1,
-    learning_rate=5e-4,
-    weight_decay=0.01,
-    bf16=False,
-    fp16=False,
-    logging_steps=1,
-    save_steps=5,
-    save_total_limit=1,
-    dataloader_num_workers=0,
-    report_to="none",
-    use_cpu=True,
-)
+training_args = create_verify_training_args(output_dir=output_dir)
 
 trainer = Trainer(
     model=model,
@@ -262,7 +173,6 @@ check("model.safetensors 存在",
 check("tokenizer 文件存在",
       os.path.isfile(os.path.join(save_dir, "tokenizer.json")))
 
-# 重新加载并验证
 loaded_model = LlamaForCausalLM.from_pretrained(save_dir)
 loaded_tokenizer = PreTrainedTokenizerFast.from_pretrained(save_dir)
 check("模型重新加载成功", loaded_model is not None)
@@ -271,7 +181,6 @@ check("加载的模型参数量一致",
 check("tokenizer 重新加载成功", loaded_tokenizer is not None)
 check("加载的 vocab size 一致", len(loaded_tokenizer) == len(tokenizer))
 
-# 验证推理（generate）
 input_text = "The future of"
 inputs = loaded_tokenizer(input_text, return_tensors="pt")
 with torch.no_grad():
